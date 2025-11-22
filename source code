@@ -1,0 +1,129 @@
+`timescale 1ns / 1ps
+
+// MODULE 1: PROCESSING ELEMENT (PE)
+module pe (
+    input wire clk,
+    input wire rst,
+    input wire [7:0] a_in,  
+    input wire [7:0] b_in,  
+    output reg [7:0] a_out, 
+    output reg [7:0] b_out, 
+    output reg [15:0] c_out 
+);
+    always @(posedge clk) begin
+        if (rst) begin
+            a_out <= 0;
+            b_out <= 0;
+            c_out <= 0;
+        end else begin
+            // MAC Operation: C = C + A * B
+            c_out <= c_out + (a_in * b_in);
+            // Pipeline data forwarding
+            a_out <= a_in;
+            b_out <= b_in;
+        end
+    end
+endmodule
+
+// MODULE 2: SYSTOLIC ARRAY 2x2
+module systolic_array_2x2 (
+    input wire clk,
+    input wire rst,
+    input wire [7:0] a0_in, a1_in, 
+    input wire [7:0] b0_in, b1_in, 
+    output wire [15:0] c00, c01, c10, c11 
+);
+    wire [7:0] a00_to_01, a10_to_11;
+    wire [7:0] b00_to_10, b01_to_11;
+    
+    wire [7:0] nc_a0, nc_a1, nc_b0, nc_b1;
+
+    // Row 0
+    pe PE00 (.clk(clk), .rst(rst), .a_in(a0_in), .b_in(b0_in), .a_out(a00_to_01), .b_out(b00_to_10), .c_out(c00));
+    pe PE01 (.clk(clk), .rst(rst), .a_in(a00_to_01), .b_in(b1_in), .a_out(nc_a0), .b_out(b01_to_11), .c_out(c01));
+
+    // Row 1
+    pe PE10 (.clk(clk), .rst(rst), .a_in(a1_in), .b_in(b00_to_10), .a_out(a10_to_11), .b_out(nc_b0), .c_out(c10));
+    pe PE11 (.clk(clk), .rst(rst), .a_in(a10_to_11), .b_in(b01_to_11), .a_out(nc_a1), .b_out(nc_b1), .c_out(c11));
+endmodule
+
+// MODULE 3: TOP MODULE - LED control
+module matrix_top (
+    input wire sys_clk,       // Clock 100MHz from Board
+    input wire sys_rst_btn,   // Reset
+    output reg [3:0] led      // 4 status LED
+);
+
+    // --- 1. Calling signals ---
+    wire [15:0] c00, c01, c10, c11; // Result Systolic Array
+    reg [7:0] a0, a1, b0, b1;       // Input feeder
+    reg [3:0] state_counter;        // Status counter
+    reg calculation_done;           
+    
+    // Reset active high 
+    wire rst = sys_rst_btn;
+
+    // --- 2. State Machine ---
+    // Ma trận A = [[1, 2], [3, 4]]
+    // Ma trận B = [[5, 6], [7, 8]]
+    // Kết quả chuẩn C = [[19, 22], [43, 50]]
+    
+    always @(posedge sys_clk) begin
+        if (rst) begin
+            state_counter <= 0;
+            a0 <= 0; a1 <= 0;
+            b0 <= 0; b1 <= 0;
+            calculation_done <= 0;
+        end else begin
+            if (state_counter < 15) 
+                state_counter <= state_counter + 1;
+
+            // Skewing Data 
+            case (state_counter)
+                4'd0: begin // 
+                    a0 <= 0; a1 <= 0; b0 <= 0; b1 <= 0;
+                end
+                4'd1: begin // 1: Push A[0][0]=1, B[0][0]=5
+                    a0 <= 1; b0 <= 5;
+                end
+                4'd2: begin // 2: Push A[0][1]=2, B[1][0]=7, A[1][0]=3, B[0][1]=6
+                    a0 <= 2; b0 <= 7;
+                    a1 <= 3; b1 <= 6;
+                end
+                4'd3: begin // 3: Push A[1][1]=4, B[1][1]=8
+                    a0 <= 0; b0 <= 0; 
+                    a1 <= 4; b1 <= 8;
+                end
+                4'd4: begin // 4: end of data
+                    a1 <= 0; b1 <= 0;
+                end
+                4'd8: begin // Waiting calculations
+                    calculation_done <= 1;
+                end
+            endcase
+        end
+    end
+
+    // --- 3. Link Systolic Array ---
+    systolic_array_2x2 array_core (
+        .clk(sys_clk),
+        .rst(rst),
+        .a0_in(a0), .a1_in(a1),
+        .b0_in(b0), .b1_in(b1),
+        .c00(c00), .c01(c01), .c10(c10), .c11(c11)
+    );
+
+    // --- 4. Self-Check ---
+    always @(posedge sys_clk) begin
+        if (rst) begin
+            led <= 4'b0000; 
+        end else if (calculation_done) begin
+            if (c00 == 19 && c01 == 22 && c10 == 43 && c11 == 50) begin
+                led <= 4'b0001; // LED 0 -> SUCCESS
+            end else begin
+                led <= 4'b1000; // LED 3 -> FAIL
+            end
+        end
+    end
+
+endmodule
