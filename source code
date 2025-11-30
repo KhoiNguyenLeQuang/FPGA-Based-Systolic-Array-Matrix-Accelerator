@@ -17,7 +17,8 @@ module pe #(
             a_out <= 0;
             b_out <= 0;
             c_out <= 0;
-        end else begin
+        end 
+        else begin
             c_out <= c_out + (a_in * b_in);       
             // Forwarding
             a_out <= a_in;
