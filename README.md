@@ -9,7 +9,7 @@ This project implements a **Systolic Array Architecture** on an FPGA to accelera
 This architecture is fundamental to modern AI Accelerators (e.g., Google TPU, NVIDIA Tensor Cores) for Deep Learning inference.
 
 ## 🧠 Architecture
-The core is a **2x2 Systolic Array** (scalable to NxN) composed of interconnected Processing Elements (PEs).
+The core is a **NxN Systolic Array** composed of interconnected Processing Elements (PEs).
 
 * **Processing Element (PE):** Performs Multiply-Accumulate (MAC) operations and forwards data to neighbors (Right/Down) in a pipelined fashion.
 * **Data Flow:** Matrix A flows horizontally (Left-to-Right), Matrix B flows vertically (Top-to-Bottom).
