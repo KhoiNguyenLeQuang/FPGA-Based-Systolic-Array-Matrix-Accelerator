@@ -1,7 +1,7 @@
 # FPGA-Based Systolic Array Matrix Accelerator
 
-Language: Verilog
-Platform: Xilinx Artix-7 FPGA (Basys 3)
+* Language: Verilog
+* Platform: Xilinx Artix-7 FPGA (Basys 3)
 
 ## Overview
 This project implements a **Systolic Array Architecture** on an FPGA to accelerate dense matrix multiplication operations ($C = C + A \times B$). Unlike traditional CPU architectures that fetch data sequentially, this design utilizes **parallel Processing Elements (PEs)** and a rhythmic data flow to maximize data reuse and throughput.
