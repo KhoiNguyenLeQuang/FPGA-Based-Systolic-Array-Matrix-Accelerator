@@ -61,19 +61,34 @@ module systolic_array_NxN #(
     endgenerate
 endmodule
 
-// MODULE 3: TOP MODULE
+// MODULE 3: TOP-LEVEL SYSTEM MODULE
 module matrix_system_top(
-    input wire sys_clk,
-    input wire sys_rst_btn,
-    output wire done_led,
-    output wire [3:0] debug_led
+    input wire sys_clk,        
+    input wire sys_rst_btn,   
+    input wire uart_rx_pin,    
+    output wire done_led,     
+    output wire [3:0] debug_led 
 );
-    parameter N = 4;
-    parameter WIDTH = 8;
-    parameter ACC_WIDTH = 32;
+
+    // --- SYSTEM PARAMETERS ---
+    parameter N = 4;          
+    parameter WIDTH = 8;      
+    parameter ACC_WIDTH = 32;  
 
     wire rst = sys_rst_btn; 
     
+    // --- UART RECEIVER INSTANTIATION ---
+    wire [7:0] received_byte;
+    wire data_ready;
+
+    uart_rx #(.CLKS_PER_BIT(868)) rx_inst (
+        .i_Clock(sys_clk),
+        .i_Rx_Serial(uart_rx_pin),
+        .o_Rx_DV(data_ready),     
+        .o_Rx_Byte(received_byte)  
+    );
+    
+    // --- DATA DRIVE REGISTERS ---
     reg [5:0] timer;
     reg [N*WIDTH-1:0] a_drive;
     reg [N*WIDTH-1:0] b_drive;
@@ -81,29 +96,36 @@ module matrix_system_top(
     always @(posedge sys_clk) begin
         if (rst) begin
             timer <= 0;
-            a_drive <= 0; b_drive <= 0;
+            a_drive <= 0; 
+            b_drive <= 0;
         end else begin
             if (timer < 30) timer <= timer + 1;
             
-            a_drive <= 0; b_drive <= 0;
-            case(timer)
-                1: begin a_drive <= {8'd4, 8'd3, 8'd2, 8'd1}; b_drive <= {8'd4, 8'd3, 8'd2, 8'd1}; end
-                2: begin a_drive <= {8'd8, 8'd7, 8'd6, 8'd5}; b_drive <= {8'd8, 8'd7, 8'd6, 8'd5}; end
-                default: begin a_drive <= 0; b_drive <= 0; end
-            endcase
+            // DATA LATCHING LOGIC:
+            if (data_ready) begin
+                a_drive <= {{24{1'b0}}, received_byte};
+                b_drive <= {{24{1'b0}}, received_byte}; 
+            end
         end
     end
 
+    // --- SYSTOLIC ARRAY INSTANTIATION ---
     wire [N*N*ACC_WIDTH-1:0] result_bus;
     
-    systolic_array_NxN #(.N(N), .WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) core (
-        .clk(sys_clk), .rst(rst),
+    systolic_array_NxN #(
+        .N(N), 
+        .WIDTH(WIDTH), 
+        .ACC_WIDTH(ACC_WIDTH)
+    ) core (
+        .clk(sys_clk), 
+        .rst(rst),
         .a_in_bus(a_drive), 
         .b_in_bus(b_drive),
         .c_out_bus(result_bus) 
     );
     
+    // --- OUTPUT ASSIGNMENTS ---
     assign done_led = (timer > 20);
-    assign debug_led = {result_bus[3], result_bus[2], result_bus[1], result_bus[0]}; 
+    assign debug_led = result_bus[3:0]; 
 
 endmodule
