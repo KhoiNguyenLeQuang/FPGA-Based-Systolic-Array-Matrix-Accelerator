@@ -27,3 +27,9 @@ set_property PACKAGE_PIN V19 [get_ports {debug_led[3]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {debug_led[3]}]
 set_false_path -to [get_ports done_led]
 set_false_path -to [get_ports {debug_led[*]}]
+
+## UART RX Pin
+set_property PACKAGE_PIN B18 [get_ports uart_rx_pin]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_rx_pin]
+set_input_delay -clock [get_clocks sys_clk_pin] -min 2.000 [get_ports uart_rx_pin]
+set_input_delay -clock [get_clocks sys_clk_pin] -max 5.000 [get_ports uart_rx_pin]
