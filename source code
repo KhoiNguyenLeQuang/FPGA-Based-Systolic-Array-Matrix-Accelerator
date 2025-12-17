@@ -2,7 +2,7 @@
 
 // MODULE 1: PROCESSING ELEMENT (PE)
 module pe #(
-    parameter D_WIDTH = 8,
+    parameter WIDTH = 8,
     parameter ACC_WIDTH = 32
 )(
     input wire clk, rst,
@@ -10,17 +10,11 @@ module pe #(
     output reg [WIDTH-1:0] a_out, b_out,
     output reg [ACC_WIDTH-1:0] c_out
 );
-    // Explicitly ask synthesis tool to use DSP slices
-    (* use_dsp = "yes" *) 
     always @(posedge clk) begin
         if (rst) begin
-            a_out <= 0;
-            b_out <= 0;
-            c_out <= 0;
-        end 
-        else begin
+            a_out <= 0; b_out <= 0; c_out <= 0;
+        end else begin
             c_out <= c_out + (a_in * b_in);       
-            // Forwarding
             a_out <= a_in;
             b_out <= b_in;
         end
@@ -29,22 +23,16 @@ endmodule
 
 // MODULE 2: SYSTOLIC ARRAY NxN
 module systolic_array_NxN #(
-    parameter N = 4,           // Matrix Dimension (4x4)
+    parameter N = 4,           
     parameter WIDTH = 8,
     parameter ACC_WIDTH = 32
 )(
     input wire clk, rst,
-    // Flattened inputs for easier connection
     input wire [N*WIDTH-1:0] a_in_bus, 
     input wire [N*WIDTH-1:0] b_in_bus,
-    // Flattened results
-    output wire [N*ACC_WIDTH-1:0] c_out_bus
+    output wire [N*N*ACC_WIDTH-1:0] c_out_bus
 );
-
-    // Internal connecting wires
-    // Horizontal wires [Row][Col+1]
     wire [WIDTH-1:0] h_wire [0:N-1][0:N]; 
-    // Vertical wires [Row+1][Col]
     wire [WIDTH-1:0] v_wire [0:N][0:N-1];
     
     genvar i, j;
@@ -52,195 +40,70 @@ module systolic_array_NxN #(
         for (i = 0; i < N; i = i + 1) begin : ROWS
             for (j = 0; j < N; j = j + 1) begin : COLS
                 
-                // 1. Connect Inputs
-                // If it's the first column (j=0), take from main input bus
-                assign h_wire[i][0] = a_in_bus[(i*WIDTH) +: WIDTH];
+                if (j == 0) begin
+                    assign h_wire[i][0] = a_in_bus[(i*WIDTH) +: WIDTH];
+                end
                 
-                // If it's the first row (i=0), take from main input bus
-                assign v_wire[0][j] = b_in_bus[(j*WIDTH) +: WIDTH];
-
-                // 2. Instantiate PE
-                pe #(.WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) pe_inst (
+                if (i == 0) begin
+                    assign v_wire[0][j] = b_in_bus[(j*WIDTH) +: WIDTH];
+                end
+                
+                 pe #(.WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) pe_inst (
                     .clk(clk), .rst(rst),
-                    .a_in(h_wire[i][j]),      // Input from left
-                    .b_in(v_wire[i][j]),      // Input from top
-                    .a_out(h_wire[i][j+1]),   // Output to right
-                    .b_out(v_wire[i+1][j]),   // Output to bottom
-                    .c_out(c_out_bus[(i*N+j)*ACC_WIDTH +: ACC_WIDTH]) // Result
+                    .a_in(h_wire[i][j]),     
+                    .b_in(v_wire[i][j]),     
+                    .a_out(h_wire[i][j+1]),   
+                    .b_out(v_wire[i+1][j]),
+                    .c_out(c_out_bus[(i*N+j)*ACC_WIDTH +: ACC_WIDTH]) 
                 );
             end
         end
     endgenerate
 endmodule
 
-// MODULE 3: SIMPLE BLOCK RAM (Reads .mem files)
-module bram_loader #(
-    parameter DATA_WIDTH = 8,
-    parameter ADDR_WIDTH = 4,
-    parameter FILENAME = "matrix_a.mem"
-)(
-    input wire clk,
-    input wire [ADDR_WIDTH-1:0] addr,
-    output reg [DATA_WIDTH-1:0] data_out
-);
-    // 16 entries for 4x4 matrix
-    reg [DATA_WIDTH-1:0] memory [0:15];
-
-    initial begin
-        $readmemh(FILENAME, memory); // Load the file
-    end
-
-    always @(posedge clk) begin
-        data_out <= memory[addr];
-    end
-endmodule
-
-// MODULE 4: TOP LEVEL - MEMORY CONTROLLER & SKEWING LOGIC
-module matrix_system_top #(
-    parameter N = 4,
-    parameter WIDTH = 8,
-    parameter ACC_WIDTH = 32
-)(
+// MODULE 3: TOP MODULE
+module matrix_system_top(
     input wire sys_clk,
     input wire sys_rst_btn,
-    output wire done_led
+    output wire done_led,
+    output wire [3:0] debug_led
 );
+    parameter N = 4;
+    parameter WIDTH = 8;
+    parameter ACC_WIDTH = 32;
 
-    // --- 1. Synchronization ---
-    reg rst_sync1, rst_sync2;
-    wire rst;
-    always @(posedge sys_clk) begin
-        rst_sync1 <= sys_rst_btn;
-        rst_sync2 <= rst_sync1;
-    end
-    assign rst = rst_sync2;
-
-    // --- 2. Memory Signals ---
-    reg [3:0] ram_addr; // Points to 0..15
-    wire [WIDTH-1:0] ram_a_out, ram_b_out;
+    wire rst = sys_rst_btn; 
     
-    // --- 3. State Machine ---
-    // We need to fetch diagonal waves. 
-    // For simplicity in Level 1: We will fetch ROW i and COL i simultaneously
-    // and rely on a "Skew Buffer" to delay them correctly.
-    
-    reg [5:0] timer; // Global timer
-    reg feeding_active;
-    
-    always @(posedge sys_clk) begin
-        if (rst) begin
-            timer <= 0;
-            ram_addr <= 0;
-            feeding_active <= 0;
-        end else begin
-            // Start sequence
-            if (timer < 30) timer <= timer + 1;
-            
-            // BRAM Address Control (Naive Linear Feed)
-            // In a real DMA, this is more complex. Here we just stream data out.
-            if (timer >= 0 && timer < N) begin
-                feeding_active <= 1;
-                ram_addr <= timer; // Read 0, 1, 2, 3...
-            end else begin
-                feeding_active <= 0;
-            end
-        end
-    end
-
-    // Instantiate BRAMs
-    bram_loader #(.FILENAME("matrix_a.mem")) ram_a (.clk(sys_clk), .addr(ram_addr), .data_out(ram_a_out));
-    bram_loader #(.FILENAME("matrix_b.mem")) ram_b (.clk(sys_clk), .addr(ram_addr), .data_out(ram_b_out));
-
-    // --- 4. DATA SKEWING (The Logic Bridge) ---
-    // The BRAM gives us a Column of A and Row of B at the same time.
-    // We must delay inputs to the array based on their index.
-    // Row 0: Delay 0
-    // Row 1: Delay 1
-    // Row 2: Delay 2 ...
-    
-    reg [WIDTH-1:0] a_skew_reg [0:N-1][0:N-1]; // 2D Shift Register for A
-    reg [WIDTH-1:0] b_skew_reg [0:N-1][0:N-1]; // 2D Shift Register for B
-    
-    // Flattened array inputs
-    wire [N*WIDTH-1:0] array_a_flat;
-    wire [N*WIDTH-1:0] array_b_flat;
-
-    integer k, m;
-    always @(posedge sys_clk) begin
-        if (rst) begin
-            for(k=0; k<N; k=k+1) begin
-                for(m=0; m<N; m=m+1) begin
-                    a_skew_reg[k][m] <= 0;
-                    b_skew_reg[k][m] <= 0;
-                end
-            end
-        end else begin
-            // Load new data from RAM into the first stage of shift registers
-            // BUT only for the specific row/col we are currently addressing
-            // Note: This logic simulates a "Banked" read.
-            // For Level 1 simplicity, we manually map RAM data to the delay lines.
-            
-            // This part is simplified for demonstration:
-            // We assume we can load the inputs into the skew buffers.
-            // (Real implementation requires standard FIFO logic).
-            
-            // SHIFT LOGIC
-            for(k=0; k<N; k=k+1) begin
-                // Shift A horizontally
-                for(m=N-1; m>0; m=m-1) begin
-                    a_skew_reg[k][m] <= a_skew_reg[k][m-1];
-                end
-                // Shift B vertically
-                for(m=N-1; m>0; m=m-1) begin
-                    b_skew_reg[k][m] <= b_skew_reg[k][m-1];
-                end
-            end
-            
-            // INJECTION LOGIC (The "Wave" generator)
-            // We are using a simplified injection here where we manually
-            // force the test pattern. In a robust design, this is an AXI Master.
-            if (timer == 1) begin 
-                 a_skew_reg[0][0] <= 1; // A00
-                 b_skew_reg[0][0] <= 1; // B00
-            end
-            // ... (For a generic N, we need a smarter injector. 
-            // Level 1 stops here: We have the structure, but the generic controller 
-            // is complex. Let's wire the BRAMs to the inputs directly for now).
-        end 
-    end
-    
-    // --- TEMPORARY LEVEL 1 SHORTCUT ---
-    // To make this compile and work without writing a 200-line AXI controller,
-    // We will wire the Hardcoded Inputs to the Scalable Array.
-    // This proves the ARRAY works, even if the Controller is basic.
-    
+    reg [5:0] timer;
     reg [N*WIDTH-1:0] a_drive;
     reg [N*WIDTH-1:0] b_drive;
     
     always @(posedge sys_clk) begin
         if (rst) begin
+            timer <= 0;
             a_drive <= 0; b_drive <= 0;
         end else begin
-           // Hardcoded Skew Logic for 4x4 (Just to demonstrate scalability)
-           case(timer)
-               // T1: Feed (0,0)
-               1: begin a_drive[7:0] <= 1; b_drive[7:0] <= 1; end
-               // T2: Feed (0,1), (1,0) ...
-               2: begin a_drive[7:0] <= 2; a_drive[15:8] <= 2; b_drive[7:0] <= 2; b_drive[15:8] <= 2; end
-               // ... (This would continue)
-               default: begin a_drive <= 0; b_drive <= 0; end
-           endcase
+            if (timer < 30) timer <= timer + 1;
+            
+            a_drive <= 0; b_drive <= 0;
+            case(timer)
+                1: begin a_drive[7:0] <= 1; b_drive[7:0] <= 1; end
+                2: begin a_drive[7:0] <= 2; b_drive[7:0] <= 2; end
+                default: begin end
+            endcase
         end
     end
 
-    // --- 5. CONNECT TO ARRAY ---
+    wire [N*N*ACC_WIDTH-1:0] result_bus;
+    
     systolic_array_NxN #(.N(N), .WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) core (
         .clk(sys_clk), .rst(rst),
         .a_in_bus(a_drive), 
         .b_in_bus(b_drive),
-        .c_out_bus() // Output is here
+        .c_out_bus(result_bus) 
     );
     
     assign done_led = (timer > 20);
+    assign debug_led = ^result_bus; 
 
 endmodule
