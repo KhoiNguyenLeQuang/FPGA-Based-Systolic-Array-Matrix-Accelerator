@@ -48,7 +48,6 @@ def send_matrix_data():
         print("------------------------------------------------")
         print("Data Sent Successfully!")
         print("Check your FPGA LEDs:")
-        print("  - DONE LED should be ON (Green)")
         print("  - DEBUG LEDs should show the result of Bottom-Right element")
         print("  - Leftmost LEDs should lights up, indicating that it finished loading")
         print("------------------------------------------------")
