@@ -63,69 +63,113 @@ endmodule
 
 // MODULE 3: TOP-LEVEL SYSTEM MODULE
 module matrix_system_top(
-    input wire sys_clk,        
-    input wire sys_rst_btn,   
-    input wire uart_rx_pin,    
-    output wire done_led,     
-    output wire [3:0] debug_led 
+    input wire sys_clk,
+    input wire sys_rst_btn,
+    input wire uart_rx_pin,
+    output wire done_led,
+    output wire [3:0] debug_led
 );
 
-    // --- SYSTEM PARAMETERS ---
-    parameter N = 4;          
-    parameter WIDTH = 8;      
-    parameter ACC_WIDTH = 32;  
+    // PARAMETERS
+    parameter N = 4;
+    parameter WIDTH = 8;
+    parameter ACC_WIDTH = 32;
+    parameter MATRIX_SIZE = N * N; // 16 elements
 
-    wire rst = sys_rst_btn; 
+    wire rst = sys_rst_btn;
+
+    // UART RECEIVER
+    wire [7:0] rx_byte;
+    wire rx_dv;
     
-    // --- UART RECEIVER INSTANTIATION ---
-    wire [7:0] received_byte;
-    wire data_ready;
-
     uart_rx #(.CLKS_PER_BIT(868)) rx_inst (
         .i_Clock(sys_clk),
         .i_Rx_Serial(uart_rx_pin),
-        .o_Rx_DV(data_ready),     
-        .o_Rx_Byte(received_byte)  
+        .o_Rx_DV(rx_dv),
+        .o_Rx_Byte(rx_byte)
     );
+
+    // INPUT BUFFERS
+    reg [WIDTH-1:0] mem_A [0:MATRIX_SIZE-1];
+    reg [WIDTH-1:0] mem_B [0:MATRIX_SIZE-1];
     
-    // --- DATA DRIVE REGISTERS ---
-    reg [5:0] timer;
-    reg [N*WIDTH-1:0] a_drive;
-    reg [N*WIDTH-1:0] b_drive;
-    
+    // Counters to track loading
+    reg [4:0] load_idx;       // 0 to 31 (tracks which byte we are receiving)
+    reg loading_complete;     // Flag when both matrices are full
+
+    // STATE MACHINE FOR LOADING
     always @(posedge sys_clk) begin
         if (rst) begin
-            timer <= 0;
-            a_drive <= 0; 
-            b_drive <= 0;
-        end else begin
-            if (timer < 30) timer <= timer + 1;
+            load_idx <= 0;
+            loading_complete <= 0;
+        end else if (rx_dv) begin
+            // First 16 bytes go to Matrix A
+            if (load_idx < MATRIX_SIZE) begin
+                mem_A[load_idx] <= rx_byte;
+                load_idx <= load_idx + 1;
+            end 
+            // Next 16 bytes go to Matrix B
+            else if (load_idx < 2*MATRIX_SIZE) begin
+                mem_B[load_idx - MATRIX_SIZE] <= rx_byte;
+                load_idx <= load_idx + 1;
+            end
             
-            // DATA LATCHING LOGIC:
-            if (data_ready) begin
-                a_drive <= {{24{1'b0}}, received_byte};
-                b_drive <= {{24{1'b0}}, received_byte}; 
+            // Check if full
+            if (load_idx == (2*MATRIX_SIZE - 1)) begin
+                loading_complete <= 1;
             end
         end
     end
 
-    // --- SYSTOLIC ARRAY INSTANTIATION ---
+    // SYSTOLIC FEEDER LOGIC
+    
+    reg [5:0] compute_cycle; 
+    reg [N*WIDTH-1:0] a_drive;
+    reg [N*WIDTH-1:0] b_drive;
+    
+    integer i;
+
+    always @(posedge sys_clk) begin
+        if (rst) begin
+            compute_cycle <= 0;
+            a_drive <= 0;
+            b_drive <= 0;
+        end else if (loading_complete) begin
+            // Run the counter
+            if (compute_cycle < 20) compute_cycle <= compute_cycle + 1;
+
+            // FEEDING LOGIC:           
+            if (compute_cycle < N) begin
+                for (i = 0; i < N; i = i + 1) begin
+                    // Feed Row i of Matrix A
+                    a_drive[(i*WIDTH) +: WIDTH] <= mem_A[i*N + compute_cycle];
+                    // Feed Col i of Matrix B
+                    b_drive[(i*WIDTH) +: WIDTH] <= mem_B[compute_cycle*N + i];
+                end
+            end else begin
+                // Stop driving after N cycles (inputs become 0)
+                a_drive <= 0;
+                b_drive <= 0;
+            end
+        end
+    end
+
+    // INSTANTIATE SYSTOLIC ARRAY
     wire [N*N*ACC_WIDTH-1:0] result_bus;
     
-    systolic_array_NxN #(
-        .N(N), 
-        .WIDTH(WIDTH), 
-        .ACC_WIDTH(ACC_WIDTH)
-    ) core (
-        .clk(sys_clk), 
+    systolic_array_NxN #(.N(N), .WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) core (
+        .clk(sys_clk),
         .rst(rst),
-        .a_in_bus(a_drive), 
+        .a_in_bus(a_drive),
         .b_in_bus(b_drive),
-        .c_out_bus(result_bus) 
+        .c_out_bus(result_bus)
     );
+
+    // --- OUTPUTS ---
+    // Turn on LED when loading is done
+    assign done_led = loading_complete; 
     
-    // --- OUTPUT ASSIGNMENTS ---
-    assign done_led = (timer > 20);
-    assign debug_led = result_bus[3:0]; 
+    // Debug: Show the bottom-right result bits on LEDs
+    assign debug_led = result_bus[3:0];
 
 endmodule
