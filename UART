@@ -1,3 +1,13 @@
+// --- Synchronization Registers ---
+    reg r_Rx_Data_R = 1'b1;
+    reg r_Rx_Data   = 1'b1;
+
+    always @(posedge i_Clock) begin
+        // Double-flop to sync async input to our clock domain
+        r_Rx_Data_R <= i_Rx_Serial;
+        r_Rx_Data   <= r_Rx_Data_R;
+    end
+
 module uart_rx #(parameter CLKS_PER_BIT = 868) (
     input        i_Clock,
     input        i_Rx_Serial,
