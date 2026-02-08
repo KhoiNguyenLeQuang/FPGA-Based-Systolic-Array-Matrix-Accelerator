@@ -128,7 +128,7 @@ reg [5:0] compute_cycle;
     reg [N*WIDTH-1:0] b_drive;
     
     integer i;
-    reg signed [5:0] data_idx; // Signed to handle negative checks safely
+    reg signed [5:0] data_idx;
 
     always @(posedge sys_clk) begin
         if (rst) begin
