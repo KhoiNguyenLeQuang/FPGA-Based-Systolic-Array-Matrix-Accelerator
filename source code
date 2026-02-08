@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-// MODULE 1: PROCESSING ELEMENT (PE)
+// MODULE 1: PROCESSING ELEMENT (PE, aka THE MATH)
 module pe #(
     parameter WIDTH = 8,
     parameter ACC_WIDTH = 32
@@ -61,7 +61,7 @@ module systolic_array_NxN #(
     endgenerate
 endmodule
 
-// MODULE 3: TOP-LEVEL SYSTEM MODULE
+// MODULE 3: SKEWING DATA FROM 
 module matrix_system_top(
     input wire sys_clk,
     input wire sys_rst_btn,
@@ -121,7 +121,8 @@ module matrix_system_top(
         end
     end
 
-    // SYSTOLIC FEEDER LOGIC
+    // SYSTOLIC FEEDER LOGIC: FEEDS NUMBERS FROM 2
+    // MATRIXES TO THE MATH OPERATIONS
     
 reg [5:0] compute_cycle; 
     reg [N*WIDTH-1:0] a_drive;
