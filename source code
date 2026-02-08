@@ -123,11 +123,12 @@ module matrix_system_top(
 
     // SYSTOLIC FEEDER LOGIC
     
-    reg [5:0] compute_cycle; 
+reg [5:0] compute_cycle; 
     reg [N*WIDTH-1:0] a_drive;
     reg [N*WIDTH-1:0] b_drive;
     
     integer i;
+    reg signed [5:0] data_idx; // Signed to handle negative checks safely
 
     always @(posedge sys_clk) begin
         if (rst) begin
@@ -135,21 +136,34 @@ module matrix_system_top(
             a_drive <= 0;
             b_drive <= 0;
         end else if (loading_complete) begin
-            // Run the counter
-            if (compute_cycle < 20) compute_cycle <= compute_cycle + 1;
+            // We need enough cycles for the wave to pass through (N inputs + N latency + margin)
+            if (compute_cycle < 30) compute_cycle <= compute_cycle + 1;
 
-            // FEEDING LOGIC:           
-            if (compute_cycle < N) begin
-                for (i = 0; i < N; i = i + 1) begin
-                    // Feed Row i of Matrix A
-                    a_drive[(i*WIDTH) +: WIDTH] <= mem_A[i*N + compute_cycle];
-                    // Feed Col i of Matrix B
-                    b_drive[(i*WIDTH) +: WIDTH] <= mem_B[compute_cycle*N + i];
+            for (i = 0; i < N; i = i + 1) begin
+                // SKEWING CALCULATION:
+                // Row 'i' should start receiving data 'i' cycles later than Row 0.
+                // The data index we need is: current_time - row_number
+                data_idx = compute_cycle - i;
+
+                // HANDLE MATRIX A (Rows)
+                if (data_idx >= 0 && data_idx < N) begin
+                    // Valid window: Fetch mem_A[Row * N + Col]
+                    a_drive[(i*WIDTH) +: WIDTH] <= mem_A[i*N + data_idx];
+                end else begin
+                    // Outside window: Feed 0s (Padding)
+                    a_drive[(i*WIDTH) +: WIDTH] <= 0;
                 end
-            end else begin
-                // Stop driving after N cycles (inputs become 0)
-                a_drive <= 0;
-                b_drive <= 0;
+
+                // HANDLE MATRIX B (Columns)
+                // Matrix B is entered Top-Down. Col 'i' is skewed by 'i' cycles.
+                if (data_idx >= 0 && data_idx < N) begin
+                    // Valid window: Fetch mem_B[Row * N + Col]
+                    // Note: mem_B is stored row-major, so B[k][i] is mem_B[k*N + i]
+                    // Here 'data_idx' acts as the Row index (k) of B being fed into Col i
+                    b_drive[(i*WIDTH) +: WIDTH] <= mem_B[data_idx*N + i];
+                end else begin
+                    b_drive[(i*WIDTH) +: WIDTH] <= 0;
+                end
             end
         end
     end
