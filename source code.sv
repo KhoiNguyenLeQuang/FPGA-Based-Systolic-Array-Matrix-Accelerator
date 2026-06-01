@@ -1,5 +1,5 @@
 `timescale 1ns / 1ps
-
+// We are using FSM here, but we are not defining the parameters like the traditional way. Instead, my FSM is based on load_idx and load_complete. 
 // MODULE 1: PROCESSING ELEMENT (PE, aka THE MATH)
 module pe #(
     parameter WIDTH = 8,
