@@ -2,7 +2,7 @@
 
 A complete hardware/verification project for a 4×4 **systolic array** matrix multiplication accelerator. The repository contains two complementary halves:
 
-1. **FPGA Implementation** — a real-time, UART-driven systolic array accelerator deployed on a Xilinx Artix-7 (Basys 3), where a Host PC streams matrix operands over serial and the result is visible on-board via LEDs.
+1. **FPGA Implementation** — a real-time, UART-driven systolic array accelerator deployed on a Xilinx Artix-7 (Basys 3), where a Host PC streams matrix operands over serial and reads all 16 results back over UART for automatic checking.
 2. **UVM Verification Environment** — a IEEE-1800.2 UVM testbench that exhaustively verifies the same `systolic_array_NxN` RTL core at the block level, achieving **100% functional coverage** across ~1,558 transactions with zero errors.
 
 Together they demonstrate the full hardware lifecycle: RTL design → FPGA deployment → rigorous functional verification.
@@ -42,7 +42,7 @@ This project demonstrates the core principles of AI acceleration hardware (simil
 
 The same RTL core (`systolic_array_NxN`) is used in both halves of the project:
 
-- On **real hardware**, it's wrapped by a UART receiver and matrix-loading logic so a Host PC can stream operands in and observe results on LEDs.
+- On **real hardware**, it's wrapped by a UART receiver and matrix-loading logic and a UART transmitter, so a Host PC can stream operands in and read every result back.
 - In **simulation**, it's the Device Under Test (DUT) for a full UVM regression suite that drives parallel stimulus directly into the array, bypassing the UART path entirely to maximize simulation throughput.
 
 ## Key Parameters
@@ -62,9 +62,10 @@ The same RTL core (`systolic_array_NxN`) is used in both halves of the project:
 This is a **closed-loop system**, not a static simulation:
 
 1. **Host PC** sends matrix data via Python/Serial.
-2. **UART Receiver** on the FPGA captures data at 115,200 baud.
+2. **UART Receiver** on the FPGA captures data at 115,200 baud (input passes through a 2-FF synchronizer).
 3. **Systolic Array** processes the data in a pipelined fashion.
-4. **On-board LEDs** provide immediate visual debugging of the result.
+4. **UART Transmitter** sends all 16 32-bit results (64 bytes) back; the Python script checks them against a software reference.
+5. **On-board LEDs** show `done_led` (results sent) and `debug_led[3:0]` (low nibble of C[0][0]).
 
 ### Hardware Architecture
 
@@ -84,10 +85,19 @@ Interconnects 16 PEs (4×4) into a mesh.
 - Data is passed to neighbors every clock cycle, achieving $O(N)$ throughput.
 
 #### 3. UART Receiver (`uart_rx.v`)
-A robust state-machine-based asynchronous receiver. It samples the incoming bitstream at 115,200 bits per second and converts it into 8-bit parallel bytes for the processing logic. A 5-state FSM (IDLE → START → DATA → STOP → CLEAN) samples bits at mid-period (`CLKS_PER_BIT = 868` at 100 MHz), raising `o_Rx_DV` for one cycle when a byte is ready.
+A state-machine-based asynchronous receiver. The raw pin first passes through a 2-flip-flop synchronizer (`r_Rx_Data_R → r_Rx_Data`), and the FSM samples only the synchronized signal. It samples the incoming bitstream at 115,200 bits per second and converts it into 8-bit parallel bytes for the processing logic. A 5-state FSM (IDLE → START → DATA → STOP → CLEAN) samples bits at mid-period (`CLKS_PER_BIT = 868` at 100 MHz), raising `o_Rx_DV` for one cycle when a byte is ready.
 
 #### 4. Top-Level System (`matrix_system_top.v`)
-Integrates the UART interface with the core logic. It receives 32 bytes (matrix A) then 32 bytes (matrix B) over UART, drives the skewed input pattern into the systolic core once both matrices are loaded, asserts `done_led` when loading is complete, and exposes `debug_led[3:0]` driven from the LSBs of the result bus.
+A 4-state controller (LOAD → COMPUTE → SEND → CLEAR):
+- **LOAD** — receives 32 bytes over UART: 16 bytes of matrix A then 16 bytes of matrix B (row-major).
+- **COMPUTE** — drives the skewed input pattern into the systolic core for `3N+1` cycles.
+- **SEND** — streams the 512-bit result bus out through `uart_tx` as 64 bytes (C[0][0]…C[3][3], row-major, each 32-bit value little-endian).
+- **CLEAR** — clears the PE accumulators, then waits for the next matrix pair (no board reset needed).
+
+Because every result bit now reaches an output pin, synthesis keeps all 16 PEs. (An earlier version only drove `result_bus[3:0]` to LEDs, which let Vivado prune 15 of the 16 PEs as unused logic.)
+
+#### 5. UART Transmitter (`uart_tx`)
+8-N-1 transmitter at the same `CLKS_PER_BIT`; one-cycle `i_Tx_DV` pulse starts a byte, `o_Tx_Done` pulses when the stop bit finishes.
 
 ### Hardware Specifications
 
@@ -97,6 +107,20 @@ Integrates the UART interface with the core logic. It receives 32 bytes (matrix 
 * **Baud Rate:** 115,200 bps
 * **Input Width:** 8-bit integers
 * **Accumulator Width:** 32-bit (to prevent overflow)
+
+### Performance
+
+| Metric | Value | How it was measured |
+|---|---|---|
+| Arithmetic resources | 16 DSP48E1 (one per PE) | Synthesis of `systolic_array_NxN` for xc7a35t |
+| Cycles per 4×4 matmul (back-to-back) | 11 (10 compute + 1 clear) | `tb_throughput.sv`, 1,000 random matrices, 0 mismatches |
+| Sustained throughput @ 100 MHz | 1.16 GOPS (128 ops / 110 ns) | 64 MACs × 2 ops per matmul |
+| Peak throughput @ 100 MHz | 3.2 GOPS | 16 PEs × 2 ops × 100 MHz |
+| CPU baseline (one Xeon core, 2.1 GHz, `gcc -O3 -march=native`) | 20 ns / matmul = 6.4 GOPS, ~3.0 ops per clock | `matmul_bench.c` |
+| Ops per clock, FPGA vs CPU | 11.6 vs ~3.0 → **~3.8×** | ratio of the two rows above |
+| End-to-end over UART | ~8.3 ms per matmul (96 bytes × 10 bits / 115,200 baud) | UART-bound; the array itself is idle >99.99% of the time |
+
+Note: in wall-clock time a 2+ GHz CPU core is faster (~20 ns vs 110 ns) for a single 4×4 multiply; the array's advantage is work per clock and it grows with N. Run `matmul_bench.c` on your own machine to reproduce the CPU numbers.
 
 ---
 
@@ -139,6 +163,7 @@ gemm_if #(N, WIDTH, ACC_WIDTH)(clk)
   - a_in_bus     : logic [N*WIDTH-1:0]
   - b_in_bus     : logic [N*WIDTH-1:0]
   - c_out_bus    : wire  [N*N*ACC_WIDTH-1:0]
+  - start        : logic  (testbench-only; high on the first cycle of each transaction)
 ```
 
 #### `package.sv` — `gemm_pkg`
@@ -189,7 +214,7 @@ Translates software transaction objects into physical signal waveforms on the DU
 **`run_phase()`** — The main driver loop:
 1. Asserts reset and zeroes the input buses on startup
 2. Waits for `negedge rst` before entering the active loop
-3. For each item from `seq_item_port.get_next_item()`: calls `compute_expected()`, broadcasts the item via `drv_ap` (so the scoreboard and coverage receive the expected answer), calls `drive_transaction()`, then toggles reset for 2 cycles to flush the PE accumulators, and finally calls `item_done()`
+3. For each item from `seq_item_port.get_next_item()`: calls `compute_expected()`, broadcasts the item via `drv_ap` (so the scoreboard and coverage receive the expected answer), calls `drive_transaction()`, then toggles reset for 2 cycles to flush the PE accumulators, and finally calls `item_done()`. During the first skewed cycle it also raises `vif.start` so the monitor knows exactly when the transaction began
 
 **`drive_transaction(item)`** — Implements the **data-skewing** algorithm required by systolic arrays. Over `(2×N − 1)` clock cycles it staggers each lane's data by one cycle relative to the previous lane (`col_idx = t − lane`). After the skewing phase it drives zero for `N` additional cycles to flush the pipeline, matching the hardware's propagation latency exactly.
 
@@ -198,7 +223,7 @@ A passive observer that captures the DUT's output without driving any signals.
 
 **`build_phase()`** — Creates `mon_ap` and retrieves the virtual interface.
 
-**`run_phase()`** — Continuously polls the input buses. When it detects non-zero activity (`a_in_bus !== '0 || b_in_bus !== '0`), it waits exactly `(3×N − 2)` clock cycles — the precise pipeline latency of the N×N array — then samples `c_out_bus`. It unpacks the flat 512-bit bus into a 4×4 array stored in `act_matrix_C`, broadcasts the item via `mon_ap`, then waits 4 cooldown cycles to skip the driver's reset pulse before resuming observation.
+**`run_phase()`** — Waits for the driver's `start` marker (high on the first cycle of each transaction — more robust than detecting non-zero data, which misses transactions whose first operands are 0), then waits exactly `(3×N − 2)` clock cycles — the precise pipeline latency of the N×N array — then samples `c_out_bus`. It unpacks the flat 512-bit bus into a 4×4 array stored in `act_matrix_C`, broadcasts the item via `mon_ap`, then waits 4 cooldown cycles to skip the driver's reset pulse before resuming observation.
 
 #### `scoreboard.sv` — `gemm_scoreboard`
 The verification correctness checker. Uses two `uvm_tlm_analysis_fifo` queues to decouple timing between the driver and monitor:
@@ -208,7 +233,7 @@ The verification correctness checker. Uses two `uvm_tlm_analysis_fifo` queues to
 
 **`run_phase()`** — Runs a `fork...join_any` construct with two parallel branches:
 
-- **Branch 1 (checker):** Continuously calls `exp_fifo.get()` and `act_fifo.get()` in tandem, waits `#1ps` for delta-cycle stability, skips comparison if `rst` is high, then performs element-wise comparison across all N×N cells. Reports `UVM_ERROR` with row/column coordinates on any mismatch; logs `PASS` on a full match.
+- **Branch 1 (checker):** Continuously calls `exp_fifo.get()` and `act_fifo.get()` in tandem, waits `#1ps` for delta-cycle stability, skips comparison if `rst` is high, then performs element-wise comparison across all N×N cells. Reports `UVM_ERROR` with row/column coordinates on any mismatch; logs `PASS` on a full match. Every compared item increments a PASS or FAIL counter (items skipped because reset was in flight are counted separately), and `report_phase()` prints a `SCOREBOARD_SUMMARY` line with the real totals.
 
 - **Branch 2 (reset watcher):** Blocks on `@(posedge vif.rst)`. If reset fires, this branch wins the `join_any`, kills Branch 1 via `disable fork`, flushes both FIFOs (to discard stale in-flight transactions), then waits for `negedge rst` and flushes again before the outer loop restarts.
 
@@ -295,7 +320,7 @@ A lightweight, UVM-free Verilog testbench for rapid sanity checking. Instantiate
 | Metric                    | Result           |
 |---------------------------|-------------------|
 | Total Functional Coverage | **100.00%**      |
-| Total Transactions        | ~1,558            |
+| Total Transactions        | ~1,558 planned — exact compared count is printed by `SCOREBOARD_SUMMARY` |
 | UVM_ERROR                 | **0**            |
 | UVM_WARNING               | 0                 |
 | UVM_FATAL                 | 0                 |
@@ -312,39 +337,22 @@ Coverage was achieved by combining:
 ## Repository Structure
 
 ```text
-├── src/
-│   ├── matrix_system_top.v     # FPGA top-level integration & I/O
-│   ├── uart_rx.v                # 115,200 baud UART receiver
-│   ├── systolic_array_NxN.v     # 4x4 mesh interconnect logic
-│   └── pe.v                     # Processing Element (MAC unit)
-├── constraints/
-│   └── basys3.xdc               # Pin mappings (Clock, Reset, UART, LEDs)
-├── host/
-│   └── serial_test.py           # Python script to stream data to FPGA
-├── verification/
-│   ├── design.sv                # RTL design under test (DUT) used by the UVM env
-│   ├── tb_smoke.v                # Standalone smoke testbench (no UVM)
-│   └── Testbench/
-│       ├── package.sv            # UVM package — ties all files together
-│       ├── interface.sv          # SystemVerilog interface (signal bundle)
-│       ├── testbench.sv          # Top-level simulation module (tb_top)
-│       ├── sequence_item.sv      # Transaction data object (gemm_seq_item)
-│       ├── base_sequence.sv      # Base randomized sequence
-│       ├── driver.sv             # UVM driver with systolic data-skewing
-│       ├── monitor.sv            # UVM monitor with pipeline latency handling
-│       ├── scoreboard.sv         # Reference model comparator + reset handling
-│       ├── coverage.sv           # Functional coverage collector
-│       ├── environment.sv        # UVM environment (wires all components)
-│       ├── base_test.sv          # Base test (parent for all other tests)
-│       ├── corner_test.sv        # Corner-case sequence + test
-│       ├── rand_test.sv          # 500-transaction random test
-│       ├── stress_test.sv        # 1,025-transaction targeted + stress test
-│       ├── reset_test.sv         # Mid-compute hardware reset test
-│       └── all_test.sv           # Master regression test (runs all 4 suites)
+├── source code.sv          # RTL: pe, systolic_array_NxN, matrix_system_top (LOAD/COMPUTE/SEND/CLEAR)
+├── UART.sv                 # uart_rx (2-FF synchronized) + uart_tx, 115,200 baud
+├── constraints.xdc         # Basys 3 pins (clock, reset, UART RX/TX, LEDs) + timing constraints
+├── test_matrix.py          # Host script: sends A,B, reads C back, checks against Python reference
+├── tb_system_uart.sv       # End-to-end RTL testbench through the UART (Icarus)
+├── tb_throughput.sv        # Back-to-back throughput testbench for the core (Icarus)
+├── matmul_bench.c          # CPU baseline benchmark for the same 4x4 uint8 matmul
+├── UVM testbench/
+│   ├── design.sv           # Single-file copy of the RTL for EDA Playground / Questa
+│   ├── tb_smoke.v          # Standalone smoke testbench (no UVM)
+│   └── Testbench/          # UVM environment (package, interface, driver, monitor,
+│                           #   scoreboard, coverage, env, sequences, tests, all_test)
 └── README.md
 ```
 
-> **Note:** The verification environment's `design.sv` is a self-contained copy of the same core RTL (`pe`, `systolic_array_NxN`, `uart_rx`, `matrix_system_top`) used by the FPGA `src/` files, packaged for simulator convenience (e.g. EDA Playground).
+> **Note:** `UVM testbench/design.sv` is a copy of `source code.sv` + `UART.sv`. Keep them in sync when the RTL changes.
 
 ---
 
@@ -357,10 +365,24 @@ Coverage was achieved by combining:
 3. Run the host-side script to stream matrices over serial:
 
 ```bash
-python host/serial_test.py
+pip install pyserial
+python test_matrix.py --port /dev/ttyUSB1 --trials 20     # Windows: --port COM4
 ```
 
-4. Observe `done_led` and `debug_led[3:0]` on the board for status and result LSBs.
+4. The script prints PASS/FAIL for each matrix pair (identity, all-0xFF, zeros, then random) and a final `N/N matrix pairs matched on hardware` line. `done_led` lights after each reply is sent.
+
+### Run the RTL testbenches (Icarus Verilog, no UVM needed)
+
+```bash
+# End-to-end: UART in -> compute -> UART out, 50 matrix pairs
+iverilog -g2012 -o sys.vvp tb_system_uart.sv "source code.sv" UART.sv && vvp sys.vvp
+
+# Back-to-back throughput of the core (prints cycles per matmul)
+iverilog -g2012 -o thr.vvp tb_throughput.sv "source code.sv" UART.sv && vvp thr.vvp
+
+# CPU baseline
+gcc -O3 -march=native matmul_bench.c -o matmul_bench && ./matmul_bench 2.1   # arg = your CPU base clock in GHz
+```
 
 ### Run the UVM Testbench
 
@@ -368,7 +390,7 @@ This project targets the Questa/ModelSim simulator (compatible with EDA Playgrou
 
 ```bash
 # Compile
-vlog -sv verification/design.sv verification/Testbench/testbench.sv
+vlog -sv "UVM testbench/design.sv" "UVM testbench/Testbench/testbench.sv"
 
 # Simulate
 vsim -c tb_top -do "run -all; quit"

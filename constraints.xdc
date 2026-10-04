@@ -31,5 +31,11 @@ set_false_path -to [get_ports {debug_led[*]}]
 ## UART RX Pin
 set_property PACKAGE_PIN B18 [get_ports uart_rx_pin]
 set_property IOSTANDARD LVCMOS33 [get_ports uart_rx_pin]
-set_input_delay -clock [get_clocks sys_clk_pin] -min 2.000 [get_ports uart_rx_pin]
-set_input_delay -clock [get_clocks sys_clk_pin] -max 5.000 [get_ports uart_rx_pin]
+# uart_rx_pin is asynchronous to sys_clk and passes through a 2-FF synchronizer in uart_rx,
+# so it is excluded from static timing analysis (fixes TIMING-18).
+set_false_path -from [get_ports uart_rx_pin]
+
+# USB-UART transmit back to the host (Basys 3 RsTx)
+set_property PACKAGE_PIN A18 [get_ports uart_tx_pin]
+set_property IOSTANDARD LVCMOS33 [get_ports uart_tx_pin]
+set_false_path -to [get_ports uart_tx_pin]
