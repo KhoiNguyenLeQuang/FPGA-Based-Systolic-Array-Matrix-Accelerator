@@ -30,6 +30,7 @@ class gemm_driver extends uvm_driver #(gemm_seq_item);
         vif.rst <= 1; 
         vif.a_in_bus <= 0;
         vif.b_in_bus <= 0;
+        vif.start    <= 0;
         @(negedge vif.rst); // Chờ đến khi hết reset
         @(posedge vif.clk); // Canh đều vào sườn lên của clock
 
@@ -43,6 +44,12 @@ class gemm_driver extends uvm_driver #(gemm_seq_item);
 
             // 3. Bơm dữ liệu: Thực sự điều khiển các chân tín hiệu phần cứng (gọi hàm bên dưới)
             drive_transaction(item);
+
+            // Give the monitor (samples 3N-2 cycles after start) and the scoreboard time to
+            // compare BEFORE the clearing reset. Without this gap the reset rose on the same
+            // edge the monitor sampled, the scoreboard's reset watcher killed every comparison,
+            // and the regression compared 0 transactions while still reporting 0 errors.
+            repeat(2) @(posedge vif.clk);
             
             // 4. Nháy Reset: Xóa sạch bộ nhớ phần cứng (các Processing Elements) 
             // để chuẩn bị đón ma trận tiếp theo. Dùng <= để an toàn về timing.
@@ -88,6 +95,7 @@ class gemm_driver extends uvm_driver #(gemm_seq_item);
             // Đưa dữ liệu ra chân tín hiệu (vif) và chờ 1 nhịp clock
             vif.a_in_bus <= local_a_bus;
             vif.b_in_bus <= local_b_bus;
+            vif.start    <= (t == 0);   // tell the monitor exactly when this transaction began
             @(posedge vif.clk);
         end
 
@@ -95,6 +103,7 @@ class gemm_driver extends uvm_driver #(gemm_seq_item);
         // để "chảy" nốt các phép tính ra tới góc dưới cùng bên phải của mảng.
         // Ta đẩy thêm số 0 vào để ép kết quả cuối cùng trôi ra ngoài.
         repeat(N) begin
+            vif.start    <= 0;
             vif.a_in_bus <= 0;
             vif.b_in_bus <= 0;
             @(posedge vif.clk);

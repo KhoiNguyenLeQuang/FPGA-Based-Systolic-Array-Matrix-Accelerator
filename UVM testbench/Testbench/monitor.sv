@@ -32,7 +32,9 @@ class gemm_monitor extends uvm_monitor;
         forever begin
             // BẮT ĐẦU PHÁT HIỆN GIAO DỊCH:
             // Nếu thấy dữ liệu ở A hoặc B khác 0, nghĩa là Driver bắt đầu nạp ma trận vào
-            if (vif.a_in_bus !== '0 || vif.b_in_bus !== '0) begin              
+            // Use the driver's explicit start marker instead of guessing from non-zero data:
+            // a transaction whose first operands are 0 (e.g. A[0][0] = B[0][0] = 0) would otherwise be detected late or never.
+            if (vif.start === 1'b1) begin              
                 
                 // CHỜ ĐỢI LATENCY (ĐỘ TRỄ PHẦN CỨNG):
                 // Theo kiến trúc Systolic Array NxN, từ lúc con số đầu tiên đi vào, 

@@ -1,5 +1,8 @@
+// design.sv -- single-file copy of the RTL (source code.sv + UART.sv) for EDA Playground / Questa.
+// The UVM environment instantiates only systolic_array_NxN from this file.
 `timescale 1ns / 1ps
-
+// We are using FSM here, but we are not defining the parameters like the traditional way. Instead, my FSM is based on load_idx and load_complete. 
+// MODULE 1: PROCESSING ELEMENT (PE, aka THE MATH)
 module pe #(
     parameter WIDTH = 8,
     parameter ACC_WIDTH = 32
@@ -20,6 +23,7 @@ module pe #(
     end
 endmodule
 
+// MODULE 2: SYSTOLIC ARRAY NxN
 module systolic_array_NxN #(
     parameter N = 4,           
     parameter WIDTH = 8,
@@ -59,6 +63,155 @@ module systolic_array_NxN #(
     endgenerate
 endmodule
 
+// MODULE 3: TOP LEVEL -- UART load -> skewed compute -> UART readback of all 16 results
+//
+// Protocol (host side: test_matrix.py):
+//   host sends 32 bytes : A (16 bytes, row-major) then B (16 bytes, row-major)
+//   FPGA replies 64 bytes: C[0][0]..C[3][3], row-major, each 32-bit value little-endian
+// After the reply the core is cleared and the board is ready for the next pair.
+//
+// Every one of the 512 result bits now reaches an output pin (through the UART TX),
+// so synthesis keeps all 16 PEs. Previously only result_bus[3:0] reached the LEDs and
+// Vivado pruned 15 of the 16 PEs as unused logic.
+module matrix_system_top #(
+    parameter N            = 4,
+    parameter WIDTH        = 8,
+    parameter ACC_WIDTH    = 32,
+    parameter CLKS_PER_BIT = 868            // 100 MHz / 115,200 baud
+)(
+    input  wire       sys_clk,
+    input  wire       sys_rst_btn,
+    input  wire       uart_rx_pin,
+    output wire       uart_tx_pin,
+    output wire       done_led,             // lit while results are being / have been sent
+    output wire [3:0] debug_led             // low nibble of C[0][0]
+);
+    localparam MATRIX_SIZE  = N * N;                    // 16 elements per matrix
+    localparam RESULT_BYTES = N * N * ACC_WIDTH / 8;    // 64 bytes
+    localparam COMPUTE_CYC  = 3*N + 1;                  // 2N-1 skew + N-1 drain + 2 margin (feeder & PE regs)
+
+    localparam S_LOAD = 2'd0, S_COMPUTE = 2'd1, S_SEND = 2'd2, S_CLEAR = 2'd3;
+
+    wire rst = sys_rst_btn;
+
+    // ---------------- UART RX ----------------
+    wire [7:0] rx_byte;
+    wire       rx_dv;
+    uart_rx #(.CLKS_PER_BIT(CLKS_PER_BIT)) rx_inst (
+        .i_Clock(sys_clk), .i_Rx_Serial(uart_rx_pin),
+        .o_Rx_DV(rx_dv),   .o_Rx_Byte(rx_byte)
+    );
+
+    // ---------------- UART TX ----------------
+    reg        tx_dv;
+    reg  [7:0] tx_byte;
+    wire       tx_active, tx_done;
+    uart_tx #(.CLKS_PER_BIT(CLKS_PER_BIT)) tx_inst (
+        .i_Clock(sys_clk), .i_Tx_DV(tx_dv), .i_Tx_Byte(tx_byte),
+        .o_Tx_Active(tx_active), .o_Tx_Serial(uart_tx_pin), .o_Tx_Done(tx_done)
+    );
+
+    // ---------------- Buffers & control ----------------
+    reg [WIDTH-1:0] mem_A [0:MATRIX_SIZE-1];
+    reg [WIDTH-1:0] mem_B [0:MATRIX_SIZE-1];
+
+    reg [1:0] state;
+    reg [5:0] load_idx;        // 0..31
+    reg [5:0] compute_cycle;   // 0..COMPUTE_CYC
+    reg [6:0] send_idx;        // 0..63
+    reg       tx_wait;         // a byte has been handed to uart_tx, waiting for tx_done
+    reg       sent_flag;
+    reg       core_clear;      // clears the PE accumulators between matrix pairs
+
+    wire [N*N*ACC_WIDTH-1:0] result_bus;
+
+    always @(posedge sys_clk) begin
+        tx_dv      <= 1'b0;
+        core_clear <= 1'b0;
+        if (rst) begin
+            state <= S_LOAD; load_idx <= 0; compute_cycle <= 0;
+            send_idx <= 0; tx_wait <= 1'b0; sent_flag <= 1'b0;
+        end else begin
+            case (state)
+                // Bytes 0-15 -> A, 16-31 -> B
+                S_LOAD: if (rx_dv) begin
+                    if (load_idx < MATRIX_SIZE) mem_A[load_idx]               <= rx_byte;
+                    else                        mem_B[load_idx - MATRIX_SIZE] <= rx_byte;
+                    sent_flag <= 1'b0;
+                    if (load_idx == 2*MATRIX_SIZE - 1) begin
+                        load_idx      <= 0;
+                        compute_cycle <= 0;
+                        state         <= S_COMPUTE;
+                    end else
+                        load_idx <= load_idx + 1;
+                end
+                // Skew feeder runs while compute_cycle counts; results are final after COMPUTE_CYC
+                S_COMPUTE: begin
+                    if (compute_cycle == COMPUTE_CYC) begin
+                        send_idx <= 0;
+                        state    <= S_SEND;
+                    end else
+                        compute_cycle <= compute_cycle + 1;
+                end
+                // Stream the 512-bit result bus out, byte 0 (LSB of C[0][0]) first.
+                // Inputs are zero here, so the accumulators hold their values while we send.
+                S_SEND: begin
+                    if (!tx_wait && !tx_active) begin
+                        tx_byte <= result_bus[send_idx*8 +: 8];
+                        tx_dv   <= 1'b1;
+                        tx_wait <= 1'b1;
+                    end else if (tx_done) begin
+                        tx_wait <= 1'b0;
+                        if (send_idx == RESULT_BYTES - 1) begin
+                            sent_flag <= 1'b1;
+                            state     <= S_CLEAR;
+                        end else
+                            send_idx <= send_idx + 1;
+                    end
+                end
+                // One-cycle accumulator clear, then wait for the next matrix pair
+                S_CLEAR: begin
+                    core_clear <= 1'b1;
+                    state      <= S_LOAD;
+                end
+            endcase
+        end
+    end
+
+    // ---------------- Skew feeder ----------------
+    // Lane i is delayed by i cycles: element index = compute_cycle - i, zero outside [0, N).
+    reg [N*WIDTH-1:0] a_drive, b_drive;
+    integer i;
+    reg signed [7:0] data_idx;
+    always @(posedge sys_clk) begin
+        if (rst || state != S_COMPUTE) begin
+            a_drive <= 0;
+            b_drive <= 0;
+        end else begin
+            for (i = 0; i < N; i = i + 1) begin
+                data_idx = $signed({2'b00, compute_cycle}) - i;
+                if (data_idx >= 0 && data_idx < N) begin
+                    a_drive[i*WIDTH +: WIDTH] <= mem_A[i*N + data_idx];   // A[i][k] into row i
+                    b_drive[i*WIDTH +: WIDTH] <= mem_B[data_idx*N + i];   // B[k][i] into column i
+                end else begin
+                    a_drive[i*WIDTH +: WIDTH] <= 0;
+                    b_drive[i*WIDTH +: WIDTH] <= 0;
+                end
+            end
+        end
+    end
+
+    // ---------------- Systolic core ----------------
+    systolic_array_NxN #(.N(N), .WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) core (
+        .clk(sys_clk), .rst(rst | core_clear),
+        .a_in_bus(a_drive), .b_in_bus(b_drive),
+        .c_out_bus(result_bus)
+    );
+
+    assign done_led  = sent_flag;
+    assign debug_led = result_bus[3:0];
+endmodule
+
 module uart_rx #(parameter CLKS_PER_BIT = 868) (
     input        i_Clock,
     input        i_Rx_Serial,
@@ -71,13 +224,17 @@ module uart_rx #(parameter CLKS_PER_BIT = 868) (
     localparam STOP  = 3'b011;
     localparam CLEAN = 3'b100;
 
-    reg [15:0] r_Clock_Count = 0; 
+    reg [15:0] r_Clock_Count = 0; // Tăng bit để tránh tràn
     reg [2:0]  r_Bit_Index = 0;
     reg [2:0]  r_SM_Main = 0;
+
+// --- Synchronization Registers ---
+// The FSM below must ONLY read r_Rx_Data (the synchronized copy), never the raw pin.
     reg r_Rx_Data_R = 1'b1;
     reg r_Rx_Data   = 1'b1;
 
     always @(posedge i_Clock) begin
+        // Double-flop to sync async input to our clock domain
         r_Rx_Data_R <= i_Rx_Serial;
         r_Rx_Data   <= r_Rx_Data_R;
     end
@@ -88,11 +245,11 @@ module uart_rx #(parameter CLKS_PER_BIT = 868) (
                 o_Rx_DV <= 1'b0;
                 r_Clock_Count <= 0;
                 r_Bit_Index <= 0;
-                if (i_Rx_Serial == 1'b0) r_SM_Main <= START;
+                if (r_Rx_Data == 1'b0) r_SM_Main <= START;
             end
             START: begin
                 if (r_Clock_Count == (CLKS_PER_BIT-1)/2) begin
-                    if (i_Rx_Serial == 1'b0) begin
+                    if (r_Rx_Data == 1'b0) begin
                         r_Clock_Count <= 0;
                         r_SM_Main <= DATA;
                     end else r_SM_Main <= IDLE;
@@ -105,7 +262,7 @@ module uart_rx #(parameter CLKS_PER_BIT = 868) (
                     r_Clock_Count <= r_Clock_Count + 1;
                 end else begin
                     r_Clock_Count <= 0;
-                    o_Rx_Byte[r_Bit_Index] <= i_Rx_Serial;
+                    o_Rx_Byte[r_Bit_Index] <= r_Rx_Data;
                     if (r_Bit_Index < 7) r_Bit_Index <= r_Bit_Index + 1;
                     else begin
                         r_Bit_Index <= 0;
@@ -131,101 +288,60 @@ module uart_rx #(parameter CLKS_PER_BIT = 868) (
     end
 endmodule
 
-module matrix_system_top(
-    input wire sys_clk,
-    input wire sys_rst_btn,
-    input wire uart_rx_pin,
-    output wire done_led,
-    output wire [3:0] debug_led
+
+// UART TRANSMITTER (8-N-1). Pulse i_Tx_DV for one cycle with i_Tx_Byte while o_Tx_Active is low.
+module uart_tx #(parameter CLKS_PER_BIT = 868) (
+    input            i_Clock,
+    input            i_Tx_DV,
+    input      [7:0] i_Tx_Byte,
+    output reg       o_Tx_Active = 1'b0,
+    output reg       o_Tx_Serial = 1'b1,
+    output reg       o_Tx_Done   = 1'b0
 );
+    localparam IDLE = 2'd0, START = 2'd1, DATA = 2'd2, STOP = 2'd3;
 
-    parameter N = 4;
-    parameter WIDTH = 8;
-    parameter ACC_WIDTH = 32;
-    parameter MATRIX_SIZE = N * N; 
+    reg [1:0]  r_State       = IDLE;
+    reg [15:0] r_Clock_Count = 0;
+    reg [2:0]  r_Bit_Index   = 0;
+    reg [7:0]  r_Byte        = 0;
 
-    wire rst = sys_rst_btn;
-
-    wire [7:0] rx_byte;
-    wire rx_dv;
-    
-    uart_rx #(.CLKS_PER_BIT(868)) rx_inst (
-        .i_Clock(sys_clk),
-        .i_Rx_Serial(uart_rx_pin),
-        .o_Rx_DV(rx_dv),
-        .o_Rx_Byte(rx_byte)
-    );
-
-    reg [WIDTH-1:0] mem_A [0:MATRIX_SIZE-1];
-    reg [WIDTH-1:0] mem_B [0:MATRIX_SIZE-1];
-    
-    reg [4:0] load_idx;       
-    reg loading_complete;    
-
-    always @(posedge sys_clk) begin
-        if (rst) begin
-            load_idx <= 0;
-            loading_complete <= 0;
-        end else if (rx_dv) begin
-            if (load_idx < MATRIX_SIZE) begin
-                mem_A[load_idx] <= rx_byte;
-                load_idx <= load_idx + 1;
-            end 
-            else if (load_idx < 2*MATRIX_SIZE) begin
-                mem_B[load_idx - MATRIX_SIZE] <= rx_byte;
-                load_idx <= load_idx + 1;
-            end
-            
-            if (load_idx == (2*MATRIX_SIZE - 1)) begin
-                loading_complete <= 1;
-            end
-        end
-    end
-    
-reg [5:0] compute_cycle; 
-    reg [N*WIDTH-1:0] a_drive;
-    reg [N*WIDTH-1:0] b_drive;
-    
-    integer i;
-    reg signed [5:0] data_idx;
-
-    always @(posedge sys_clk) begin
-        if (rst) begin
-            compute_cycle <= 0;
-            a_drive <= 0;
-            b_drive <= 0;
-        end else if (loading_complete) begin
-            if (compute_cycle < 30) compute_cycle <= compute_cycle + 1;
-
-            for (i = 0; i < N; i = i + 1) begin
-                data_idx = compute_cycle - i;
-
-                if (data_idx >= 0 && data_idx < N) begin
-                    a_drive[(i*WIDTH) +: WIDTH] <= mem_A[i*N + data_idx];
-                end else begin
-                    a_drive[(i*WIDTH) +: WIDTH] <= 0;
-                end
-
-                if (data_idx >= 0 && data_idx < N) begin
-                    b_drive[(i*WIDTH) +: WIDTH] <= mem_B[data_idx*N + i];
-                end else begin
-                    b_drive[(i*WIDTH) +: WIDTH] <= 0;
+    always @(posedge i_Clock) begin
+        o_Tx_Done <= 1'b0;
+        case (r_State)
+            IDLE: begin
+                o_Tx_Serial   <= 1'b1;
+                r_Clock_Count <= 0;
+                r_Bit_Index   <= 0;
+                if (i_Tx_DV) begin
+                    o_Tx_Active <= 1'b1;
+                    r_Byte      <= i_Tx_Byte;
+                    r_State     <= START;
                 end
             end
-        end
+            START: begin                                   // start bit = 0
+                o_Tx_Serial <= 1'b0;
+                if (r_Clock_Count < CLKS_PER_BIT-1) r_Clock_Count <= r_Clock_Count + 1;
+                else begin r_Clock_Count <= 0; r_State <= DATA; end
+            end
+            DATA: begin                                    // 8 data bits, LSB first
+                o_Tx_Serial <= r_Byte[r_Bit_Index];
+                if (r_Clock_Count < CLKS_PER_BIT-1) r_Clock_Count <= r_Clock_Count + 1;
+                else begin
+                    r_Clock_Count <= 0;
+                    if (r_Bit_Index < 7) r_Bit_Index <= r_Bit_Index + 1;
+                    else begin r_Bit_Index <= 0; r_State <= STOP; end
+                end
+            end
+            STOP: begin                                    // stop bit = 1
+                o_Tx_Serial <= 1'b1;
+                if (r_Clock_Count < CLKS_PER_BIT-1) r_Clock_Count <= r_Clock_Count + 1;
+                else begin
+                    r_Clock_Count <= 0;
+                    o_Tx_Done     <= 1'b1;
+                    o_Tx_Active   <= 1'b0;
+                    r_State       <= IDLE;
+                end
+            end
+        endcase
     end
-
-    wire [N*N*ACC_WIDTH-1:0] result_bus;
-    
-    systolic_array_NxN #(.N(N), .WIDTH(WIDTH), .ACC_WIDTH(ACC_WIDTH)) core (
-        .clk(sys_clk),
-        .rst(rst),
-        .a_in_bus(a_drive),
-        .b_in_bus(b_drive),
-        .c_out_bus(result_bus)
-    );
-
-    assign done_led = loading_complete; 
-    assign debug_led = result_bus[3:0];
-
 endmodule

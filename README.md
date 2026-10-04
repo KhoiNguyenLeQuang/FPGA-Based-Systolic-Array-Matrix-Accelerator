@@ -214,7 +214,7 @@ Translates software transaction objects into physical signal waveforms on the DU
 **`run_phase()`** — The main driver loop:
 1. Asserts reset and zeroes the input buses on startup
 2. Waits for `negedge rst` before entering the active loop
-3. For each item from `seq_item_port.get_next_item()`: calls `compute_expected()`, broadcasts the item via `drv_ap` (so the scoreboard and coverage receive the expected answer), calls `drive_transaction()`, then toggles reset for 2 cycles to flush the PE accumulators, and finally calls `item_done()`. During the first skewed cycle it also raises `vif.start` so the monitor knows exactly when the transaction began
+3. For each item from `seq_item_port.get_next_item()`: calls `compute_expected()`, broadcasts the item via `drv_ap` (so the scoreboard and coverage receive the expected answer), calls `drive_transaction()`, waits 2 cycles so the monitor and scoreboard can compare the result, then toggles reset for 2 cycles to flush the PE accumulators, and finally calls `item_done()`. During the first skewed cycle it also raises `vif.start` so the monitor knows exactly when the transaction began
 
 **`drive_transaction(item)`** — Implements the **data-skewing** algorithm required by systolic arrays. Over `(2×N − 1)` clock cycles it staggers each lane's data by one cycle relative to the previous lane (`col_idx = t − lane`). After the skewing phase it drives zero for `N` additional cycles to flush the pipeline, matching the hardware's propagation latency exactly.
 
@@ -320,12 +320,14 @@ A lightweight, UVM-free Verilog testbench for rapid sanity checking. Instantiate
 | Metric                    | Result           |
 |---------------------------|-------------------|
 | Total Functional Coverage | **100.00%**      |
-| Total Transactions        | ~1,558 planned — exact compared count is printed by `SCOREBOARD_SUMMARY` |
+| Transactions compared     | 1,540 (all PASS), from `SCOREBOARD_SUMMARY` |
 | UVM_ERROR                 | **0**            |
 | UVM_WARNING               | 0                 |
 | UVM_FATAL                 | 0                 |
-| Simulation Time           | 233,435 ns        |
+| Simulation Time           | 263,035 ns        |
 | Coverage Database         | `fcover.acdb`     |
+
+> **Testbench fix (2-cycle gap before the clearing reset).** In the first version the driver raised reset on the same edge the monitor sampled the result. The scoreboard's reset watcher then killed every comparison and flushed its FIFOs, so the regression compared **0** transactions while still reporting 0 errors. This was confirmed by injecting a deliberate bug into the PE (product dropped when `a_in == 255`): the old testbench still reported 0 errors, while the fixed testbench reports `FAIL: 106` with 489 cell mismatches. Also note `agent.sv` (`gemm_agent`) was missing from the original upload.
 
 Coverage was achieved by combining:
 - **Corner cases** to hit the `zero` and `max_val` bins
@@ -348,7 +350,7 @@ Coverage was achieved by combining:
 │   ├── design.sv           # Single-file copy of the RTL for EDA Playground / Questa
 │   ├── tb_smoke.v          # Standalone smoke testbench (no UVM)
 │   └── Testbench/          # UVM environment (package, interface, driver, monitor,
-│                           #   scoreboard, coverage, env, sequences, tests, all_test)
+│                           #   scoreboard, coverage, agent, env, sequences, tests, all_test)
 └── README.md
 ```
 

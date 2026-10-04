@@ -7,4 +7,5 @@ interface gemm_if #(parameter N=4, parameter WIDTH=8, parameter ACC_WIDTH=32) (
     logic [N*WIDTH-1:0]       a_in_bus;
     logic [N*WIDTH-1:0]       b_in_bus;
     wire  [N*N*ACC_WIDTH-1:0] c_out_bus;
+    logic                     start;   // testbench-only marker: high for the first cycle of each transaction (not a DUT port)
 endinterface

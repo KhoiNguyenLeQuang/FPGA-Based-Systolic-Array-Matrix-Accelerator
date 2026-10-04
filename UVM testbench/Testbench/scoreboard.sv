@@ -10,6 +10,9 @@ class gemm_scoreboard extends uvm_scoreboard;
     // Interface dùng để theo dõi chân Reset của phần cứng
     virtual gemm_if vif;
 
+    // Real counts of what was actually checked (report these, not the planned sequence sizes)
+    int unsigned n_pass = 0, n_fail = 0, n_skipped = 0;
+
     function new(string name = "gemm_scoreboard", uvm_component parent = null);
         super.new(name, parent);
     endfunction
@@ -50,6 +53,7 @@ class gemm_scoreboard extends uvm_scoreboard;
 
                         // Nếu trong lúc này mạch đang bị Reset thì bỏ qua không chấm
                         if (vif.rst === 1'b1) begin
+                            n_skipped++;
                             continue; 
                         end
 
@@ -69,6 +73,8 @@ class gemm_scoreboard extends uvm_scoreboard;
                         end
 
                         // Nếu kiểm tra hết 16 ô mà không có lỗi nào
+                        if (error_found) n_fail++; else n_pass++;
+
                         if (!error_found) begin
                             `uvm_info("PASS", $sformatf(">>> SUCCESS: Full %0dx%0d hardware matrix matches reference calculation model safely!", N, N), UVM_LOW)
                         end
@@ -99,4 +105,12 @@ class gemm_scoreboard extends uvm_scoreboard;
             act_fifo.flush(); // Dọn dẹp sạch sẽ một lần nữa để sẵn sàng cho hiệp đấu mới.
         end
     endtask
+
+    // Final summary: the transaction count to quote on the CV / in the docs
+    virtual function void report_phase(uvm_phase phase);
+        super.report_phase(phase);
+        `uvm_info("SCOREBOARD_SUMMARY", $sformatf(
+            "Transactions compared: %0d | PASS: %0d | FAIL: %0d | skipped (reset in flight): %0d",
+            n_pass + n_fail, n_pass, n_fail, n_skipped), UVM_NONE)
+    endfunction
 endclass
